@@ -1,0 +1,28 @@
+{
+  "id": "security-scanner",
+  "name": "Security Scanner",
+  "description": "Scans agent commands and responses via an external Flask API for approve/deny decisions before execution or delivery.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "flaskApiUrl": {
+        "type": "string"
+      },
+      "flaskApiToken": {
+        "type": "string"
+      }
+    },
+    "required": ["flaskApiUrl"]
+  },
+  "uiHints": {
+    "flaskApiUrl": {
+      "label": "Scanner API URL",
+      "help": "Base URL of the Flask scanning API (e.g. http://localhost:5000)"
+    },
+    "flaskApiToken": {
+      "label": "Scanner API Token",
+      "help": "Bearer token for authenticating with the scanning API. Supports SecretRef (e.g. ${SCANNER_API_TOKEN})."
+    }
+  }
+}

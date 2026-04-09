@@ -1,0 +1,15 @@
+{
+  "name": "@openclaw/security-scanner",
+  "version": "2026.4.8",
+  "private": true,
+  "description": "OpenClaw security scanner plugin — hooks into agent lifecycle to approve/deny commands and responses via an external API.",
+  "type": "module",
+  "devDependencies": {
+    "@openclaw/plugin-sdk": "workspace:*"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
