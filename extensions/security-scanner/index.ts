@@ -1,9 +1,5 @@
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import crypto from "node:crypto";
 import { definePluginEntry, type OpenClawPluginApi } from "./api.js";
-import { scanCommand, scanResponse, fetchKey } from "./src/flask-client.js";
+import { scanCommand, scanResponse, executeRemote } from "./src/flask-client.js";
 
 type SecurityScannerConfig = {
   flaskApiUrl?: string;
@@ -26,36 +22,25 @@ const BLOCKED_TOOL_MESSAGE =
 const BLOCKED_RESPONSE_MESSAGE =
   "I am unable to share that information due to the security policy. Please ask me something else.";
 
-const TEMP_KEY_PREFIX = "openclaw-ssh-";
-
-// Track temp key files per tool call so after_tool_call can clean them up.
-const pendingKeyFiles = new Map<string, string>();
-
-function generateTempKeyPath(): string {
-  const id = crypto.randomBytes(8).toString("hex");
-  return path.join(os.tmpdir(), `${TEMP_KEY_PREFIX}${id}`);
+// Extracts the actual command from an SSH command string.
+// "ssh master@1.2.3.4 df -h"          → "df -h"
+// "ssh -o Opt master@1.2.3.4 ls -la"  → "ls -la"
+function extractRemoteCommand(sshCommand: string): string | null {
+  const match = sshCommand.match(
+    /ssh\s+(?:[^\s]+\s+)*?(?:[a-zA-Z0-9_.-]+@)?\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?\s+(.*)/,
+  );
+  return match?.[1]?.trim() || null;
 }
 
-async function writeTempKey(keyContent: string): Promise<string> {
-  const keyPath = generateTempKeyPath();
-  await fs.writeFile(keyPath, keyContent, { encoding: "utf8", mode: 0o600 });
-  await fs.chmod(keyPath, 0o600);
-  return keyPath;
+// Extracts the target IP from an SSH command string.
+function extractTargetIp(command: string): string | null {
+  const match = command.match(/(?:[a-zA-Z0-9_.-]+@)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
+  return match?.[1] || null;
 }
 
-async function deleteTempKey(keyPath: string): Promise<void> {
-  try {
-    await fs.unlink(keyPath);
-  } catch {
-    // File may already be deleted or never created — ignore.
-  }
-}
-
-function rewriteSshCommand(command: string, keyPath: string): string {
-  // Insert -i /tmp/key right after "ssh" in the command.
-  // Handles: "ssh master@1.2.3.4 cmd" → "ssh -i /tmp/key master@1.2.3.4 cmd"
-  // Also handles: "ssh -o Option user@host cmd" → "ssh -i /tmp/key -o Option user@host cmd"
-  return command.replace(/^(\s*ssh\s)/, `$1-i ${keyPath} `);
+// Shell-escapes a string for safe use inside echo.
+function shellEscapeForEcho(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/'/g, "'\\''");
 }
 
 export default definePluginEntry({
@@ -78,9 +63,12 @@ export default definePluginEntry({
     }));
 
     // ── Hook 2: before_tool_call ────────────────────────────────
-    // Scans exec/read commands via Flask API. For Cloudways connected
-    // servers, fetches the SSH key from DB, writes it to a temp file,
-    // and rewrites the command to use -i /tmp/key.
+    // For Cloudways servers: sends the command to our API for remote
+    // execution. Our API SSHes to the server and returns the output.
+    // The hook rewrites the command to just echo the output, so
+    // OpenClaw never SSHes directly and never touches the SSH key.
+    //
+    // For non-Cloudways / local: lets the command pass through as-is.
     api.on("before_tool_call", async (event, ctx) => {
       if (!TOOLS_TO_SCAN.has(event.toolName)) {
         return;
@@ -113,32 +101,42 @@ export default definePluginEntry({
         };
       }
 
-      // If this is a Cloudways connected server, fetch the SSH key and
-      // rewrite the command to include it.
+      // Cloudways connected server: execute the command via our API,
+      // not locally. Our API SSHes to the server and returns the output.
       if (result.cloudways && result.server_ip && event.toolName === "exec") {
-        const keyResult = await fetchKey(apiUrl, apiToken, {
-          server_ip: result.server_ip,
+        const targetIp = result.server_ip;
+        const remoteCmd = extractRemoteCommand(commandOrPath) ?? commandOrPath;
+
+        const execResult = await executeRemote(apiUrl, apiToken, {
+          server_ip: targetIp,
+          command: remoteCmd,
+          agentId: ctx.agentId,
         });
 
-        if (!keyResult.ok || !keyResult.ssh_private_key) {
+        if (!execResult.ok) {
           return {
             block: true,
-            blockReason: keyResult.error ?? "Failed to retrieve SSH key for this Cloudways server.",
+            blockReason: execResult.error ?? "Failed to execute command on Cloudways server.",
           };
         }
 
-        const keyPath = await writeTempKey(keyResult.ssh_private_key);
+        // Build output text the same way a real SSH command would return it.
+        let output = execResult.stdout ?? "";
+        if (execResult.stderr) {
+          output += output ? `\n${execResult.stderr}` : execResult.stderr;
+        }
+        if (execResult.exit_code !== undefined && execResult.exit_code !== 0) {
+          output += `\n[exit code: ${execResult.exit_code}]`;
+        }
 
-        // Track the temp file so after_tool_call can delete it.
-        const trackingId = event.toolCallId ?? `${Date.now()}`;
-        pendingKeyFiles.set(trackingId, keyPath);
-
-        const rewrittenCommand = rewriteSshCommand(commandOrPath, keyPath);
-
+        // Rewrite the command to just print the output.
+        // OpenClaw runs: printf '%s' '<output>'
+        // The AI model sees this output as if SSH ran normally.
+        const safeOutput = shellEscapeForEcho(output);
         return {
           params: {
             ...(event.params as Record<string, unknown>),
-            command: rewrittenCommand,
+            command: `printf '%s' '${safeOutput}'`,
           },
         };
       }
@@ -146,18 +144,7 @@ export default definePluginEntry({
       // Non-Cloudways or non-exec: approved, let it pass as-is.
     });
 
-    // ── Hook 3: after_tool_call ─────────────────────────────────
-    // Cleans up temp SSH key files after the command finishes.
-    api.on("after_tool_call", async (event) => {
-      const trackingId = event.toolCallId ?? "";
-      const keyPath = pendingKeyFiles.get(trackingId);
-      if (keyPath) {
-        pendingKeyFiles.delete(trackingId);
-        await deleteTempKey(keyPath);
-      }
-    });
-
-    // ── Hook 4: message_sending ─────────────────────────────────
+    // ── Hook 3: message_sending ─────────────────────────────────
     // Scans outbound replies before they reach the user. If the Flask
     // API denies, the original message is replaced with a safe refusal.
     api.on("message_sending", async (event, ctx) => {

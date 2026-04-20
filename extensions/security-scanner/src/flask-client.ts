@@ -35,6 +35,21 @@ export type FetchKeyResult = {
 };
 
 const REQUEST_TIMEOUT_MS = 10_000;
+const EXEC_TIMEOUT_MS = 300_000; // 5 minutes for remote command execution
+
+export type ExecRemotePayload = {
+  server_ip: string;
+  command: string;
+  agentId?: string;
+};
+
+export type ExecRemoteResult = {
+  ok: boolean;
+  stdout?: string;
+  stderr?: string;
+  exit_code?: number;
+  error?: string;
+};
 
 export async function scanCommand(
   apiUrl: string,
@@ -93,6 +108,46 @@ export async function fetchKey(
     };
   } catch {
     return { ok: false, error: "Key fetch returned invalid JSON." };
+  }
+}
+
+export async function executeRemote(
+  apiUrl: string,
+  token: string | undefined,
+  payload: ExecRemotePayload,
+): Promise<ExecRemoteResult> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${apiUrl}/exec/run`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(EXEC_TIMEOUT_MS),
+    });
+  } catch {
+    return { ok: false, error: "Remote execution API is unreachable." };
+  }
+
+  if (!response.ok) {
+    return { ok: false, error: `Remote execution returned HTTP ${response.status}.` };
+  }
+
+  try {
+    const data = (await response.json()) as Record<string, unknown>;
+    return {
+      ok: true,
+      stdout: typeof data.stdout === "string" ? data.stdout : "",
+      stderr: typeof data.stderr === "string" ? data.stderr : "",
+      exit_code: typeof data.exit_code === "number" ? data.exit_code : undefined,
+      error: typeof data.error === "string" ? data.error : undefined,
+    };
+  } catch {
+    return { ok: false, error: "Remote execution returned invalid JSON." };
   }
 }
 
