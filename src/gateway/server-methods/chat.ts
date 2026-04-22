@@ -16,6 +16,7 @@ import type { ReplyPayload } from "../../auto-reply/types.js";
 import { resolveSessionFilePath } from "../../config/sessions.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { jsonUtf8Bytes } from "../../infra/json-utf8-bytes.js";
+import { applyMessageSendingForReplyPayload } from "../../infra/outbound/deliver.js";
 import type { PromptImageOrderEntry } from "../../media/prompt-image-order.js";
 import { type SavedMedia, saveMediaBuffer } from "../../media/store.js";
 import { createChannelReplyPipeline } from "../../plugin-sdk/channel-reply-pipeline.js";
@@ -1754,7 +1755,17 @@ export const chatHandlers: GatewayRequestHandlers = {
           if (info.kind !== "block" && info.kind !== "final") {
             return;
           }
-          deliveredReplies.push({ payload, kind: info.kind });
+          const hookResult = await applyMessageSendingForReplyPayload({
+            to: sessionKey,
+            payload,
+            channel: INTERNAL_MESSAGE_CHANNEL,
+            accountId,
+            conversationId: sessionKey,
+          });
+          if (hookResult.cancelled) {
+            return;
+          }
+          deliveredReplies.push({ payload: hookResult.payload, kind: info.kind });
         },
       });
 

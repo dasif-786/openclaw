@@ -1,7 +1,7 @@
 {
   "id": "security-scanner",
   "name": "Security Scanner",
-  "description": "Scans agent commands and responses via an external Flask API for approve/deny decisions before execution or delivery.",
+  "description": "Scans exec/read and outbound messages via a Flask API; registers cloudways_server_lookup (POST /lookup) and routes managed Cloudways remote exec through the API.",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

@@ -508,6 +508,59 @@ async function applyMessageSendingHook(params: {
   }
 }
 
+/**
+ * Runs `message_sending` plugin hooks for a reply payload without outbound channel delivery.
+ * Used by Control UI / webchat, which buffers assistant text instead of using {@link deliverOutboundPayloads}.
+ */
+export async function applyMessageSendingForReplyPayload(params: {
+  to: string;
+  payload: ReplyPayload;
+  /** Logical channel id (e.g. `webchat`) — passed as hook context `channelId` and in event metadata. */
+  channel: string;
+  accountId?: string;
+  conversationId?: string;
+}): Promise<{ cancelled: boolean; payload: ReplyPayload }> {
+  const hookRunner = getGlobalHookRunner();
+  const hasMessageSendingHooks = hookRunner?.hasHooks("message_sending") ?? false;
+  if (!hasMessageSendingHooks) {
+    return { cancelled: false, payload: params.payload };
+  }
+  const payloadSummary = buildPayloadSummary(params.payload);
+  try {
+    const sendingResult = await hookRunner!.runMessageSending(
+      {
+        to: params.to,
+        content: payloadSummary.text,
+        metadata: {
+          channel: params.channel,
+          accountId: params.accountId,
+          mediaUrls: payloadSummary.mediaUrls,
+        },
+      },
+      {
+        channelId: params.channel,
+        accountId: params.accountId,
+        conversationId: params.conversationId ?? params.to,
+      },
+    );
+    if (sendingResult?.cancel) {
+      return { cancelled: true, payload: params.payload };
+    }
+    if (sendingResult?.content == null) {
+      return { cancelled: false, payload: params.payload };
+    }
+    return {
+      cancelled: false,
+      payload: {
+        ...params.payload,
+        text: sendingResult.content,
+      },
+    };
+  } catch {
+    return { cancelled: false, payload: params.payload };
+  }
+}
+
 export async function deliverOutboundPayloads(
   params: DeliverOutboundPayloadsParams,
 ): Promise<OutboundDeliveryResult[]> {

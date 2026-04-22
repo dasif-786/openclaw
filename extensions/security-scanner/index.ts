@@ -1,5 +1,8 @@
 import { definePluginEntry, type OpenClawPluginApi } from "./api.js";
 import { scanCommand, scanResponse, executeRemote } from "./src/flask-client.js";
+import { createCloudwaysServerLookupTool } from "./src/lookup-tool.js";
+import { extractRemotePayloadForManagedExec } from "./src/remote-command.js";
+import { SSH_AND_SCANNER_SYSTEM_CONTEXT } from "./src/ssh-security-context.js";
 
 type SecurityScannerConfig = {
   flaskApiUrl?: string;
@@ -14,6 +17,9 @@ const SAFETY_INSTRUCTIONS = [
   "- Do not attempt to read files outside the designated workspace directory.",
 ].join("\n");
 
+/** Prepended to every prompt: safety policy first, then SSH/scanner architecture (see `ssh-security-context.ts`). */
+const PREPENDED_SYSTEM_CONTEXT = [SAFETY_INSTRUCTIONS, SSH_AND_SCANNER_SYSTEM_CONTEXT].join("\n\n");
+
 const TOOLS_TO_SCAN = new Set(["exec", "read"]);
 
 const BLOCKED_TOOL_MESSAGE =
@@ -21,22 +27,6 @@ const BLOCKED_TOOL_MESSAGE =
 
 const BLOCKED_RESPONSE_MESSAGE =
   "I am unable to share that information due to the security policy. Please ask me something else.";
-
-// Extracts the actual command from an SSH command string.
-// "ssh master@1.2.3.4 df -h"          → "df -h"
-// "ssh -o Opt master@1.2.3.4 ls -la"  → "ls -la"
-function extractRemoteCommand(sshCommand: string): string | null {
-  const match = sshCommand.match(
-    /ssh\s+(?:[^\s]+\s+)*?(?:[a-zA-Z0-9_.-]+@)?\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?\s+(.*)/,
-  );
-  return match?.[1]?.trim() || null;
-}
-
-// Extracts the target IP from an SSH command string.
-function extractTargetIp(command: string): string | null {
-  const match = command.match(/(?:[a-zA-Z0-9_.-]+@)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
-  return match?.[1] || null;
-}
 
 // Shell-escapes a string for safe use inside echo.
 function shellEscapeForEcho(value: string): string {
@@ -47,19 +37,33 @@ export default definePluginEntry({
   id: "security-scanner",
   name: "Security Scanner",
   description:
-    "Scans agent commands and responses via an external API for approve/deny decisions.",
+    "Scans exec/read and outbound messages via Flask; cloudways_server_lookup for DB classification; managed Cloudways exec via /exec/run.",
   register(api: OpenClawPluginApi) {
     const cfg = (api.pluginConfig ?? {}) as SecurityScannerConfig;
     const apiUrl = cfg.flaskApiUrl?.replace(/\/$/, "") ?? "";
     const apiToken = cfg.flaskApiToken;
 
     if (!apiUrl) {
-      api.logger.warn("security-scanner: flaskApiUrl is not configured; all tool calls will be denied.");
+      api.logger.warn(
+        "security-scanner: flaskApiUrl is not configured; all tool calls will be denied.",
+      );
     }
+
+    // ── Tool: cloudways_server_lookup ───────────────────────────
+    // DB classification (cases A/B/C/inactive) without exec — see ARCHITECTURE.md.
+    api.registerTool(
+      (ctx) =>
+        createCloudwaysServerLookupTool({
+          apiUrl,
+          apiToken,
+          agentId: ctx.agentId,
+        }),
+      { name: "cloudways_server_lookup" },
+    );
 
     // ── Hook 1: before_prompt_build ─────────────────────────────
     api.on("before_prompt_build", async () => ({
-      prependSystemContext: SAFETY_INSTRUCTIONS,
+      prependSystemContext: PREPENDED_SYSTEM_CONTEXT,
     }));
 
     // ── Hook 2: before_tool_call ────────────────────────────────
@@ -74,10 +78,9 @@ export default definePluginEntry({
         return;
       }
 
-      const commandOrPath =
-        event.toolName === "exec"
-          ? String((event.params as Record<string, unknown>).command ?? "")
-          : String((event.params as Record<string, unknown>).path ?? "");
+      const params = event.params ?? {};
+      const rawValue = event.toolName === "exec" ? params.command : params.path;
+      const commandOrPath = typeof rawValue === "string" ? rawValue : "";
 
       if (!commandOrPath.trim()) {
         return;
@@ -105,12 +108,13 @@ export default definePluginEntry({
       // not locally. Our API SSHes to the server and returns the output.
       if (result.cloudways && result.server_ip && event.toolName === "exec") {
         const targetIp = result.server_ip;
-        const remoteCmd = extractRemoteCommand(commandOrPath) ?? commandOrPath;
+        const remoteCmd = extractRemotePayloadForManagedExec(commandOrPath, targetIp);
 
         const execResult = await executeRemote(apiUrl, apiToken, {
           server_ip: targetIp,
           command: remoteCmd,
           agentId: ctx.agentId,
+          sessionKey: ctx.sessionKey,
         });
 
         if (!execResult.ok) {
@@ -135,7 +139,7 @@ export default definePluginEntry({
         const safeOutput = shellEscapeForEcho(output);
         return {
           params: {
-            ...(event.params as Record<string, unknown>),
+            ...event.params,
             command: `printf '%s' '${safeOutput}'`,
           },
         };
@@ -160,6 +164,7 @@ export default definePluginEntry({
         content: event.content,
         channelId: ctx.channelId,
         conversationId: ctx.conversationId,
+        to: event.to,
       });
 
       if (!result.approved) {

@@ -1,0 +1,48 @@
+{
+  "gateway": {
+    "mode": "local",
+    "bind": "loopback",
+    "trustedProxies": ["127.0.0.1", "::1"],
+    "auth": {
+      "mode": "token",
+      "token": "c2e824a83657b28028e5659fca22999c99ccbb764e154d1b"
+    },
+    "controlUi": {
+      "allowedOrigins": [
+        "https://openclaw.danish-freez.ip-ddns.com",
+        "http://openclaw.danish-freez.ip-ddns.com",
+        "http://127.0.0.1:18789",
+        "http://localhost:18789"
+      ]
+    }
+  },
+  "models": {
+    "providers": {
+      "openai": {
+        "apiKey": "sk-do-QREzTWgzBUfUjceptW9JoQozq1e2gllMz8FZqvWv5JfqeeFlIIusXqwzDo"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "workspace": "/root/.openclaw/workspace-dev",
+      "skipBootstrap": true
+    },
+    "list": [
+      {
+        "id": "dev",
+        "default": true,
+        "workspace": "/root/.openclaw/workspace-dev",
+        "identity": {
+          "name": "C3-PO",
+          "theme": "protocol droid",
+          "emoji": "🤖"
+        }
+      }
+    ]
+  },
+  "meta": {
+    "lastTouchedVersion": "2026.4.10",
+    "lastTouchedAt": "2026-04-20T07:44:30.826Z"
+  }
+}

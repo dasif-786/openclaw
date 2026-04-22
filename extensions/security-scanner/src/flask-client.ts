@@ -9,6 +9,9 @@ export type ScanResponsePayload = {
   content: string;
   channelId?: string;
   conversationId?: string;
+  /** Same as message_sending `to` (often session key for webchat); helps Flask logs correlate. */
+  to?: string;
+  sessionKey?: string;
 };
 
 export type ScanResult = {
@@ -20,20 +23,6 @@ export type ScanResult = {
   server_ip?: string;
 };
 
-export type FetchKeyPayload = {
-  server_ip?: string;
-  customer_id?: string;
-};
-
-export type FetchKeyResult = {
-  ok: boolean;
-  ssh_private_key?: string;
-  ssh_user?: string;
-  server_ip?: string;
-  customer_id?: string;
-  error?: string;
-};
-
 const REQUEST_TIMEOUT_MS = 10_000;
 const EXEC_TIMEOUT_MS = 300_000; // 5 minutes for remote command execution
 
@@ -41,6 +30,7 @@ export type ExecRemotePayload = {
   server_ip: string;
   command: string;
   agentId?: string;
+  sessionKey?: string;
 };
 
 export type ExecRemoteResult = {
@@ -48,6 +38,21 @@ export type ExecRemoteResult = {
   stdout?: string;
   stderr?: string;
   exit_code?: number;
+  error?: string;
+};
+
+/** Response body from POST /lookup (Flask MW database classification). */
+export type LookupServerResponse = {
+  case?: string;
+  case_label?: string;
+  in_database?: boolean;
+  cloudways_managed?: boolean;
+  connected?: boolean | null;
+  is_active?: boolean | null;
+  customer_id?: string | null;
+  ssh_user?: string | null;
+  server_ip?: string;
+  message?: string;
   error?: string;
 };
 
@@ -67,11 +72,12 @@ export async function scanResponse(
   return await postScan(`${apiUrl}/scan/response`, token, payload);
 }
 
-export async function fetchKey(
+export async function lookupServer(
   apiUrl: string,
   token: string | undefined,
-  payload: FetchKeyPayload,
-): Promise<FetchKeyResult> {
+  serverIp: string,
+  agentId?: string,
+): Promise<{ ok: true; data: LookupServerResponse } | { ok: false; error: string }> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (token) {
     headers["Authorization"] = `Bearer ${token}`;
@@ -79,36 +85,41 @@ export async function fetchKey(
 
   let response: Response;
   try {
-    response = await fetch(`${apiUrl}/keys/fetch`, {
+    response = await fetch(`${apiUrl}/lookup`, {
       method: "POST",
       headers,
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        server_ip: serverIp.trim(),
+        ...(agentId ? { agentId } : {}),
+      }),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch {
-    return { ok: false, error: "Key fetch API is unreachable." };
+    return { ok: false, error: "Lookup API is unreachable." };
+  }
+
+  const rawText = await response.text();
+  let data: LookupServerResponse;
+  try {
+    data = JSON.parse(rawText) as LookupServerResponse;
+  } catch {
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: `Lookup returned HTTP ${response.status} (non-JSON response). If this is 404, restart the Scanner service so POST /lookup is registered.`,
+      };
+    }
+    return { ok: false, error: "Lookup API returned invalid JSON." };
   }
 
   if (!response.ok) {
-    return { ok: false, error: `Key fetch returned HTTP ${response.status}.` };
+    return {
+      ok: false,
+      error: data.error ?? `Lookup returned HTTP ${response.status}.`,
+    };
   }
 
-  try {
-    const data = (await response.json()) as Record<string, unknown>;
-    const key = typeof data.ssh_private_key === "string" ? data.ssh_private_key : "";
-    if (!key) {
-      return { ok: false, error: "Key fetch returned empty key." };
-    }
-    return {
-      ok: true,
-      ssh_private_key: key,
-      ssh_user: typeof data.ssh_user === "string" ? data.ssh_user : undefined,
-      server_ip: typeof data.server_ip === "string" ? data.server_ip : undefined,
-      customer_id: typeof data.customer_id === "string" ? data.customer_id : undefined,
-    };
-  } catch {
-    return { ok: false, error: "Key fetch returned invalid JSON." };
-  }
+  return { ok: true, data };
 }
 
 export async function executeRemote(

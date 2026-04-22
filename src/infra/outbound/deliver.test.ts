@@ -91,6 +91,7 @@ type DeliverModule = typeof import("./deliver.js");
 
 let deliverOutboundPayloads: DeliverModule["deliverOutboundPayloads"];
 let normalizeOutboundPayloads: DeliverModule["normalizeOutboundPayloads"];
+let applyMessageSendingForReplyPayload: DeliverModule["applyMessageSendingForReplyPayload"];
 
 const whatsappChunkConfig: OpenClawConfig = {
   channels: { whatsapp: { textChunkLimit: 4000 } },
@@ -188,7 +189,8 @@ function expectSuccessfulWhatsAppInternalHookPayload(
 
 describe("deliverOutboundPayloads", () => {
   beforeAll(async () => {
-    ({ deliverOutboundPayloads, normalizeOutboundPayloads } = await import("./deliver.js"));
+    ({ deliverOutboundPayloads, normalizeOutboundPayloads, applyMessageSendingForReplyPayload } =
+      await import("./deliver.js"));
   });
 
   beforeEach(() => {
@@ -1102,6 +1104,40 @@ describe("deliverOutboundPayloads", () => {
       }),
       expect.objectContaining({ channelId: "whatsapp" }),
     );
+  });
+
+  it("applyMessageSendingForReplyPayload runs message_sending hooks without channel delivery", async () => {
+    hookMocks.runner.hasHooks.mockImplementation((name) => name === "message_sending");
+    hookMocks.runner.runMessageSending.mockResolvedValue({ content: "safe" });
+    const result = await applyMessageSendingForReplyPayload({
+      to: "agent:main:sess",
+      payload: { text: "leak" },
+      channel: "webchat",
+      conversationId: "agent:main:sess",
+    });
+    expect(result.cancelled).toBe(false);
+    expect(result.payload.text).toBe("safe");
+    expect(hookMocks.runner.runMessageSending).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "agent:main:sess",
+        content: "leak",
+      }),
+      expect.objectContaining({
+        channelId: "webchat",
+        conversationId: "agent:main:sess",
+      }),
+    );
+  });
+
+  it("applyMessageSendingForReplyPayload skips when no message_sending hooks are registered", async () => {
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+    const result = await applyMessageSendingForReplyPayload({
+      to: "x",
+      payload: { text: "hi" },
+      channel: "webchat",
+    });
+    expect(result.payload.text).toBe("hi");
+    expect(hookMocks.runner.runMessageSending).not.toHaveBeenCalled();
   });
 });
 

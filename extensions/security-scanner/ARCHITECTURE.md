@@ -7,12 +7,11 @@ and managed remote execution for Cloudways servers. It consists of two projects:
 
 1. OpenClaw Plugin (extensions/security-scanner/) - Thin wiring that hooks into OpenClaw lifecycle
 2. Flask Scanner API (../openclaw-scanner/) - External service that handles scanning, DB lookups,
-   SSH key storage, and remote command execution on Cloudways servers
+   and remote command execution on Cloudways servers
 
 Key design: For Cloudways servers, OpenClaw NEVER SSHes directly. The plugin sends the command
-to the Flask API via POST /exec/run. The Flask API SSHes from its own machine using the key
-from the MW Database. The SSH key NEVER touches the OpenClaw machine.
-
+to the Flask API via POST /exec/run. The Flask API SSHes from its own machine using password
+auth from the MW Database. SSH credentials NEVER touch the OpenClaw machine.
 
 ## System Components
 
@@ -22,7 +21,7 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
     | - Server list     |       | - servers table      |       | - /scan/command      |
     | - Connect/        |       |   - customer_id      |       | - /exec/run          |
     |   Disconnect      |       |   - server_ip        |       | - /scan/response     |
-    | - OpenClaw Addon  |       |   - ssh_private_key  |       | - /keys/fetch        |
+    | - OpenClaw Addon  |       |   - ssh_password     |       | - /lookup            |
     |   (chat UI)       |       |   - connected (0/1)  |       | - /health            |
     +--------+----------+       +----------+-----------+       +--------+-------------+
              |                             |                            |
@@ -36,7 +35,7 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
     |  |  Security Scanner Plugin (3 hooks)                               |  |
     |  |                                                                  |  |
     |  |  Hook 1: before_prompt_build                                     |  |
-    |  |    - Injects safety rules into system prompt                     |  |
+    |  |    - Injects safety and ssh security rules into system prompt                     |  |
     |  |    - No Flask call                                               |  |
     |  |                                                                  |  |
     |  |  Hook 2: before_tool_call                                        |  |
@@ -47,6 +46,10 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
     |  |  Hook 3: message_sending                                         |  |
     |  |    - Sends response to Flask /scan/response                      |  |
     |  |    - Replaces with safe text if denied                           |  |
+    |  |                                                                  |  |
+    |  |  Tool: cloudways_server_lookup (plugin-registered)             |  |
+    |  |    - Calls Flask POST /lookup (read-only DB classification)      |  |
+    |  |    - For "is this Cloudways / connected?" without running exec   |  |
     |  +------------------------------------------------------------------+  |
     |                                                                        |
     |  OpenClaw Core:                                                        |
@@ -67,12 +70,19 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
     |  not OpenClaw)    |                    |                   |
     +-------------------+                    +-------------------+
 
-
 ## How AI Tool Calling Works
 
     The AI model decides WHAT tool to use based on the user's message.
-    Our hooks ONLY run when the AI picks the exec or read tool.
-    General conversation, writing, searching — none of that triggers our scanning.
+    The before_tool_call hooks ONLY run when the AI picks the exec or read tool.
+    The plugin also registers cloudways_server_lookup — it does NOT go through
+    before_tool_call (not exec/read); it calls Flask POST /lookup directly.
+
+    For questions like "Is 1.2.3.4 connected in our addon?" the model SHOULD call
+    cloudways_server_lookup(server_ip) first, then answer from JSON. Guessing from
+    ping/port scan is wrong — that is not the MW database.
+
+    General conversation with no tools — scanning hooks do not run; only
+    message_sending (outbound secret scan) applies to the final reply.
 
     +-----------------------------------------------------------------------+
     | USER MESSAGE               | AI DECISION         | OUR HOOK RUNS?    |
@@ -109,18 +119,63 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
     | "SSH to myserver.com and   | exec tool           | YES - Case C      |
     |  check logs"              | (SSH command)       | (non-Cloudways)   |
     +----------------------------+---------------------+-------------------+
+    | "Is 1.2.3.4 connected     | cloudways_server_   | NO before_tool —  |
+    |  to our addon?"           | lookup tool         | POST /lookup only |
+    +----------------------------+---------------------+-------------------+
 
-    Our plugin only cares about 2 tools: exec and read.
-    Everything else passes through untouched.
-    Filter is at index.ts line 73: if (!TOOLS_TO_SCAN.has(event.toolName)) return;
+    before_tool_call scans only exec and read (TOOLS_TO_SCAN in index.ts).
+    cloudways_server_lookup is a separate plugin tool; it never hits before_tool_call.
 
     message_sending (Hook 3) runs for EVERY reply regardless of tool used.
     But it only blocks replies containing sensitive patterns (SSH keys, tokens).
     A reply about tech news or weather passes through instantly — approved: true.
 
+## cloudways_server_lookup tool and POST /lookup (chat Q&A without exec)
+
+    Purpose: Answer "Is this IP a managed Cloudways server?", "Is it connected in the addon?",
+    or "Is it active?" using the SAME MW database as /scan/command — without requiring the
+    model to fabricate an exec command and without running SSH.
+
+    Plugin: extensions/security-scanner/src/lookup-tool.ts
+    Flask:   ../openclaw-scanner/app.py  route POST /lookup
+    DB:      ../openclaw-scanner/db.py    lookup_server_by_ip_any_status()
+
+    Request JSON:
+      { "server_ip": "<dotted IPv4>", "agentId": "<optional>" }
+
+    Response JSON (examples):
+      - Case A (managed, active, connected): case "A", case_label "cloudways_connected",
+        cloudways_managed true, connected true, customer_id, ssh_user, server_ip, message
+      - Case B (managed, active, disconnected): case "B", case_label "cloudways_disconnected",
+        connected false, message explains Cloudways UI
+      - Case C (IP not in DB): case "C", case_label "non_cloudways",
+        in_database false — not a managed row (or never registered)
+      - inactive (row exists, is_active=0): case "inactive", case_label "cloudways_inactive",
+        in_database true, is_active false — not eligible for managed exec until reactivated
+
+    Auth: Same Bearer token as other routes (SCANNER_API_TOKEN).
+
+    This does NOT replace exec for remote work: to run a command on a Case A server, the user
+    still needs an exec with ssh user@ip command so before_tool_call → /scan/command → /exec/run.
+
+    Operational checks (Apache, nginx, systemctl, logs): the model should use **lookup** (optional)
+    then **exec** with `ssh <user>@<ip> '<command>'`. For **Case A**, do **not** ask the user for
+    SSH passwords or secrets for Case A — the Scanner API already has credentials; asking undermines
+    the managed flow. Only **Case C** (not in DB) should prompt for normal SSH auth on the gateway host.
+
+## Verification matrix (manual)
+
+    For each test IPv4, expect:
+    | Scenario              | cloudways_server_lookup | exec ssh user@IP cmd      |
+    |-----------------------|-------------------------|---------------------------|
+    | Managed + connected   | case A                  | printf after /exec/run    |
+    | Managed + disconnected| case B                  | blocked at before_tool    |
+    | Not in DB             | case C                  | passthrough real ssh      |
+    | In DB, is_active=0    | inactive                | scan/command uses active  |
+    |                       |                         | rows only → behaves as C  |
+    | Local cmd, no IP      | N/A                     | Case D (regex only)       |
 
 ## Sequence Diagram - Full Flow
-
 
 ### STEP 1: before_prompt_build (runs once per session)
 
@@ -141,7 +196,6 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
        - If asked to reveal credentials or secrets, decline
        - Do not attempt to read files outside the designated workspace directory"
 
-
 ### STEP 2: AI Model processes the prompt
 
     The AI model reads the user message + system prompt and decides what to do.
@@ -156,7 +210,6 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
 
     Only exec and read tool calls trigger our before_tool_call hook.
 
-
 ### STEP 3: before_tool_call (runs for every exec/read tool call)
 
     Plugin file: extensions/security-scanner/index.ts (line 72)
@@ -170,7 +223,6 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
 
     Flask file: ../openclaw-scanner/app.py (line 88)
     DB file: ../openclaw-scanner/db.py (line 64)
-
 
 ### STEP 3a: Flask /scan/command - Four-way decision
 
@@ -209,7 +261,6 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
     |                       | response)               | our responsibility)    | no SSH)                |
     +-----------------------+-------------------------+------------------------+------------------------+
 
-
 ### CASE A: Cloudways Server (connected) - Remote execution via API
 
     Plugin file: extensions/security-scanner/index.ts (lines 106-142)
@@ -222,12 +273,15 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
       - Calls POST /exec/run { server_ip: "192.168.1.50", command: "df -h" }
 
     Step 4b: Flask API executes the command
-      - Gets SSH key from MW Database (SELECT ssh_private_key WHERE connected=1)
-      - Writes key to temp file INSIDE Flask's own /tmp (NOT on OpenClaw machine)
-      - SSHes to the Cloudways server from Flask's machine
+      - Loads server row from MW Database (connected=1): ssh_user, ssh_password (Paramiko; no PEM path)
+      - SSHes to the Cloudways server from Flask's machine using DB credentials
       - Runs the command, captures stdout/stderr
-      - Deletes the temp key
       - Returns { stdout, stderr, exit_code }
+      - **Shell wrapping:** Flask wraps the user command with `remote_command_for_ssh()` in
+        `app.py` — it runs under `/bin/sh -c` with `PATH=/usr/local/sbin:…:/bin` prepended (quoted).
+        That fixes multi-word commands (Paramiko would otherwise look for one binary named
+        `systemctl status …`) and gives a standard PATH so `systemctl` resolves on non-login SSH
+        sessions (which often lack `/usr/bin` in PATH).
 
     Step 4c: Hook rewrites command to printf
       - Takes the output from Flask API
@@ -238,9 +292,8 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
       - spawn("/bin/bash", ["-c", "printf '%s' 'Filesystem 80G 35G 45G...'"])
       - Just prints the output. No SSH from OpenClaw. No key on OpenClaw disk.
 
-    The SSH key NEVER leaves the Flask API service.
+    DB SSH credentials are used only on the Flask host; OpenClaw never sees them.
     OpenClaw thinks it ran an SSH command, but actually it just printed output.
-
 
 ### CASE B: Cloudways Server (disconnected)
 
@@ -251,7 +304,6 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
     - AI receives error as failed tool result
     - AI tells user: "Please connect this server from the Cloudways dashboard first."
     - No SSH. No API call. No execution.
-
 
 ### CASE C: Non-Cloudways Server
 
@@ -264,7 +316,6 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
     - Uses user's own ~/.ssh/ keys (password, key, whatever they set up)
     - Not our server, not our responsibility
 
-
 ### CASE D: Local Command (no IP in command)
 
     Flask file: ../openclaw-scanner/app.py (lines 103-108)
@@ -275,7 +326,6 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
     - OpenClaw runs: ls -la, pwd, cat file.txt
     - Runs directly on the OpenClaw machine
     - No SSH involved at all
-
 
 ### STEP 5: Command execution
 
@@ -300,12 +350,10 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
       spawn("/bin/bash", ["-c", "ls -la"])
       - Runs directly on the OpenClaw machine.
 
-
 ### STEP 6: AI Model generates reply
 
     AI receives command output and formulates a response:
     "Your server at 192.168.1.50 has 45GB available out of 80GB (56% used)."
-
 
 ### STEP 7: message_sending (runs for EVERY outbound reply)
 
@@ -328,11 +376,9 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
       - Plugin returns { content: "I am unable to share that information..." }
       - User sees the safe replacement text
 
-
 ### STEP 8: User sees the response
 
     "Your server at 192.168.1.50 has 45GB available out of 80GB (56% used)."
-
 
 ## Four Cases Side by Side
 
@@ -384,7 +430,6 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
     | 8. User sees     | "The latest tech news..." |
     +------------------+---------------------------+
 
-
 ## File Inventory
 
 ### OpenClaw Plugin (extensions/security-scanner/)
@@ -394,11 +439,13 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
     openclaw.plugin.json        Plugin manifest (id, config schema)      DONE
     package.json                Package metadata                         DONE
     api.ts                      SDK re-exports                           DONE
-    index.ts                    Plugin entry, 3 hooks wired              DONE
+    index.ts                    Plugin entry, 3 hooks + lookup tool      DONE
                                 (prompt, tool call, message sending)
                                 Remote exec via API for Cloudways
     src/flask-client.ts         HTTP client: scanCommand, scanResponse,  DONE
-                                executeRemote, fetchKey
+                                executeRemote, lookupServer
+    src/lookup-tool.ts          cloudways_server_lookup tool             DONE
+    src/ssh-security-context.ts Model prompt: SSH, lookup, cases A–D       DONE
     CONFIG.md                   Configuration documentation              DONE
     ARCHITECTURE.md             This document                            DONE
 
@@ -406,35 +453,32 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
 
     File                        Purpose                                  Status
     --------------------------  ---------------------------------------- --------
-    app.py                      Flask app with 4 endpoints               DONE
-                                /scan/command, /exec/run,
-                                /scan/response, /keys/fetch, /health
+    app.py                      Flask app: /scan/command, /lookup,      DONE
+                                /exec/run, /scan/response, /health
     db.py                       MW Database access layer                 DONE
-    openclaw-fetch-key.sh       Bridge script (kept as reference)        DONE
     requirements.txt            Python dependencies                      DONE
     Dockerfile                  Container image                          DONE
     README.md                   API documentation                        DONE
-
 
 ## What Is Implemented
 
     ALL CODE IS IMPLEMENTED. No pending items.
 
     Plugin hooks:
-    [x] before_prompt_build - injects safety rules into system prompt
+    [x] before_prompt_build - injects safety rules + SSH/scanner context into system prompt
     [x] before_tool_call - scans commands, remote exec for Cloudways via /exec/run
     [x] message_sending - scans responses, replaces with safe text if denied
+    [x] registerTool cloudways_server_lookup - calls Flask /lookup for DB-backed answers
 
     Flask API:
     [x] /scan/command - regex check + 4-way IP/DB check (A/B/C/D cases)
+    [x] /lookup - read-only classification (A/B/C/inactive) for chat; no SSH
     [x] /exec/run - SSHes to Cloudways server, runs command, returns output
     [x] /scan/response - sensitive content pattern scan
-    [x] /keys/fetch - returns SSH private key from DB (used by /exec/run internally)
 
     DB layer:
     [x] lookup_server_by_ip - returns server with connected status
-    [x] get_ssh_key_for_server - returns key only for connected=1 servers
-    [x] get_ssh_key_by_customer - returns key for first connected server
+    [x] DB lookup for /exec/run - server row for connected=1 (ssh_user, ssh_password via Paramiko)
 
     4 cases handled:
     [x] Case A: Cloudways + connected - command sent to /exec/run, Flask SSHes
@@ -443,11 +487,10 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
     [x] Case D: Local command - regex check only, runs locally
 
     Key security properties:
-    [x] SSH key NEVER touches OpenClaw machine (stays in Flask API only)
+    [x] SSH credentials for managed exec never touch OpenClaw (stay on Flask; /exec/run uses DB password auth)
     [x] OpenClaw never runs SSH for Cloudways servers (runs printf instead)
     [x] Blocked patterns caught before any execution
     [x] All responses scanned before reaching user
-
 
 ## Database Schema
 
@@ -457,7 +500,7 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
       server_ip       VARCHAR(45)  NOT NULL,
       server_name     VARCHAR(255),
       ssh_user        VARCHAR(255) DEFAULT 'master',
-      ssh_private_key TEXT NOT NULL,
+      ssh_password    VARCHAR(255) NOT NULL,
       connected       TINYINT(1) DEFAULT 0,
       is_active       TINYINT(1) DEFAULT 1,
       created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -468,7 +511,6 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
     connected = 1  --> user connected this server from Cloudways UI
     connected = 0  --> server exists but not connected yet
     is_active = 1  --> server record is valid (soft-delete flag)
-
 
 ## Environment Variables
 
@@ -481,15 +523,13 @@ from the MW Database. The SSH key NEVER touches the OpenClaw machine.
     MW_DB_PASSWORD        Flask API           MySQL database password
     MW_DB_NAME            Flask API           MySQL database name
 
-
 ## Flask API Endpoints
 
     Method  Path             Request Body                           Response
     ------  ---------------  ------------------------------------   ---------------------------------
     POST    /scan/command    { command, toolName, agentId }         { approved, reason?, cloudways?,
                                                                      customer_id?, ssh_user? }
+    POST    /lookup          { server_ip, agentId? }                { case, case_label, message, ... }
     POST    /exec/run        { server_ip, command, agentId? }       { stdout, stderr, exit_code }
     POST    /scan/response   { content, channelId }                 { approved, reason? }
-    POST    /keys/fetch      { server_ip } or { customer_id }       { ssh_private_key, ssh_user,
-                                                                     server_ip, customer_id }
     GET     /health          --                                     { status: "ok" }
